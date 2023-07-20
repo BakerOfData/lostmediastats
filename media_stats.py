@@ -1,0 +1,177 @@
+import re
+import requests
+import sqlite3
+
+API_URL = "https://lostmediawiki.com/w/api.php"
+
+def extract_content_page_id():
+    params = {
+        "action" : "query",
+        "format" : "json",
+        "list"   : "allpages",
+        "apfilterredir" : "nonredirects",
+        "aplimit" : "500"
+    }
+    headers = {"User-Agent": "Geoff/1.0"}
+
+    con = sqlite3.connect("lostmediawiki.db")
+    cur = con.cursor()
+
+    if (cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='content_pages'").fetchone() is None):
+        cur.execute("CREATE TABLE content_pages ( \
+            page_id INT PRIMARY KEY \
+        );")
+
+    while True:
+        req = requests.get(API_URL, headers=headers, params=params)
+        res = req.json()
+        for page in res["query"]["allpages"]:
+            cur.execute("INSERT OR IGNORE INTO content_pages (page_id) VALUES (?)", (page["pageid"],))
+
+        if "continue" not in res.keys():
+            break
+        params["apcontinue"] = res["continue"]["apcontinue"]
+
+    con.commit()
+    con.close()
+
+def get_revisions_for_page_id(page_id, cur):
+    params = {
+        "action" : "query",
+        "format" : "json",
+        "prop"   : "revisions",
+        "pageids" : str(page_id),
+        "rvprop" : "ids|timestamp|comment|user|content",
+        "rvslots" : "main",
+        "rvlimit" : "50"
+    }
+    headers = {"User-Agent": "Geoff/1.0"}
+
+    req = requests.get(API_URL, headers=headers, params=params)
+    result = req.json()
+
+    for revision in result["query"]["pages"][str(page_id)]["revisions"]:
+        username = None if "userhidden" in revision.keys() else revision["user"]
+        content = None if "texthidden" in revision["slots"]["main"].keys() else revision["slots"]["main"]["*"]
+        comment = None if "commenthidden" in revision.keys() else revision["comment"]
+        cur.execute("INSERT OR IGNORE INTO revisions (rev_id, page_id, user, timestamp, content, comment) VALUES \
+                    (?, ?, ?, ?, ?, ?)", (revision["revid"], str(page_id), username, revision["timestamp"], content, comment))
+
+def get_revisions_for_all_page_ids():
+    con = sqlite3.connect("lostmediawiki.db")
+    cur = con.cursor()
+
+    if (cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='revisions'").fetchone() is None):
+        cur.execute("CREATE TABLE revisions ( \
+            rev_id INT PRIMARY KEY, \
+            page_id INT, \
+            user VARCHAR, \
+            timestamp DATETIME, \
+            content VARCHAR, \
+            comment VARCHAR, \
+            FOREIGN KEY (page_id) REFERENCES content_pages(page_id) \
+        );")
+     
+    cur.execute("SELECT * FROM content_pages")
+
+    for page in cur.fetchall():
+        if (cur.execute("SELECT * FROM revisions WHERE page_id=?", (str(page[0]),)).fetchone() is None): #TODO this is hacky don't keep
+            print("Extracting: %s" % page[0])
+            get_revisions_for_page_id(page[0], cur)
+        else:
+            print("Already processed: %s" % page[0])
+    
+    con.commit()
+    con.close()
+
+# We format so that categories which are malformed are still tracked
+def format_category_string(string):
+    return string.strip().lower().replace("_", " ").replace("-", " ")
+
+# Regex is truely disgusting...
+CATEGORY_TAG = r"\[\[Category:([\w -]+)(?:|[^\]]+)?\]\]"
+LMW_TEMPLATE_CATEGORY = r"{{LMW(?:\n*\|\w+=[^|]+)+\n*\|status=([\w -]+)(?:\n*\|\w+=[^|]+)*\n*}}"
+
+LMW_TO_CATEGORY_TAG = {"found"           : "found media",
+                       "lost"            : "completely lost media",
+                       "partially lost"  : "partially lost media",
+                       "partially found" : "partially found media"}
+
+# Weird categories (special characters, empty categories etc.) are just ignored
+def parse_categories(revision_id, cur):
+    revision_content_tuple = cur.execute("SELECT content FROM revisions WHERE rev_id=?", (str(revision_id),)).fetchone()
+    revision_content = (revision_content_tuple[0] if revision_content_tuple[0] else "")
+
+    category_tags = re.findall(CATEGORY_TAG, revision_content)
+    for category in category_tags:
+        formated = format_category_string(category)
+        cur.execute("INSERT OR IGNORE INTO categories (rev_id, category) values (?, ?)", (revision_id, formated))
+
+    lmw_template_status = re.search(LMW_TEMPLATE_CATEGORY, revision_content)
+    if lmw_template_status:
+        formated = format_category_string(lmw_template_status.group(1))
+        if formated in LMW_TO_CATEGORY_TAG.keys():
+            formated = LMW_TO_CATEGORY_TAG[format_category_string(lmw_template_status.group(1))]
+            cur.execute("INSERT OR IGNORE INTO categories (rev_id, category) values (?, ?)", (revision_id, formated))
+    
+def parse_categories_for_all_revisions():
+    con = sqlite3.connect("lostmediawiki.db")
+    cur = con.cursor()
+
+    if (cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='categories'").fetchone() is None):
+        cur.execute("CREATE TABLE categories ( \
+            rev_id INT, \
+            category VARCHAR, \
+            PRIMARY KEY (rev_id, category), \
+            FOREIGN KEY (rev_id) REFERENCES revisions(rev_id) \
+        );")
+    
+    cur.execute("SELECT rev_id FROM revisions")
+
+    for rev_id in cur.fetchall():
+        if (cur.execute("SELECT * FROM categories WHERE rev_id=?", (str(rev_id[0]),)).fetchone() is None): #TODO this is hacky don't keep
+            print("Parsing: %s" % rev_id[0])
+            parse_categories(rev_id[0], cur)
+        else:
+            print("Already processed: %s" % rev_id[0])
+
+    con.commit()
+    con.close()
+
+def create_table_if_empty(name, schema, cur):
+    if (cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+                     .fetchone() is None):
+        cur.execute("CREATE TABLE {} ({});".format(name, schema))
+
+# Incorrect combinations:
+# non-existance+completely lost
+#SELECT t1.category as item1, t2.category as item2, COUNT(*) as cnt FROM categories t1, categories t2 on t1.rev_id = t2.rev_id WHERE t1.category < t2.category AND ("existence unconfirmed" IN (t1.category, t2.category) OR "non aexistence confirmed" in (t1.category, t2.category)) GROUP BY t1.category, t2.category ORDER BY COUNT(*);
+
+# "non-existance confirmed" could mean partially or completely, going by the "3D Groove Games" article
+def status_whitelist(cur):
+    schema = "status VARCHAR PRIMARY KEY"
+    create_table_if_empty("status_whitelist", schema, cur)
+
+    STATUSES = ["completely lost media",
+                "found media",
+                "partially found media",
+                "partially lost media"]
+
+    for status in STATUSES:
+        cur.execute("INSERT INTO status_whitelist (status) VALUES (?)", (status,))
+
+# Now the fun really starts
+def status_changes():
+    pass
+
+    #CREATE VIEW status_counts AS SELECT category, COUNT(*) FROM most_recent_revision, categories ON most_recent_revision.rev_id = categories.rev_id WHERE category IN (SELECT * FROM status_whitelist) GROUP BY category
+
+#CREATE VIEW most_recent_revision AS SELECT t1.* FROM revisions t1, (SELECT page_id, MAX(timestamp) timestamp FROM revisions GROUP BY page_id) t2 ON t1.page_id = t2.page_id AND t1.timestamp = t2.timestamp
+# Any pages with more than 50 revisions? 51st and onward revisions were missed out, you fuck!
+if __name__ == "__main__":
+#    con = sqlite3.connect("lostmediawiki.db")
+#    cur = con.cursor()
+#    status_whitelist(cur)
+#    con.commit()
+#    con.close()
+    parse_categories_for_all_revisions()
