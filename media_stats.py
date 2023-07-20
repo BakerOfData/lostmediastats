@@ -1,6 +1,9 @@
 import re
 import requests
 import sqlite3
+from datetime import datetime, timedelta
+import pandas as pd
+from plotnine import ggplot, aes, geom_area, scale_x_datetime
 
 API_URL = "https://lostmediawiki.com/w/api.php"
 
@@ -160,18 +163,77 @@ def status_whitelist(cur):
     for status in STATUSES:
         cur.execute("INSERT INTO status_whitelist (status) VALUES (?)", (status,))
 
+def daterange(start_date, end_date):
+    for n in range(int((end_date - start_date).days)):
+        yield start_date + timedelta(n)
+
 # Now the fun really starts
 def status_changes():
-    pass
+    LATEST_REVISIONS_ON_DATE = "SELECT t1.* FROM losted_revisions t1, " \
+                               "(SELECT page_id, MAX(timestamp) timestamp FROM revisions " \
+                                                        "WHERE timestamp <= %s GROUP BY page_id) " \
+                                "t2 ON t1.page_id = t2.page_id AND t1.timestamp = t2.timestamp"
 
-    #CREATE VIEW status_counts AS SELECT category, COUNT(*) FROM most_recent_revision, categories ON most_recent_revision.rev_id = categories.rev_id WHERE category IN (SELECT * FROM status_whitelist) GROUP BY category
+    STATUS_COUNTS_ON_DATE =    "SELECT category, COUNT(*) FROM ({}) t1, categories t2 ON t1.rev_id = t2.rev_id " \
+                               "WHERE category IN (SELECT * FROM status_whitelist) GROUP BY category" \
+                                .format(LATEST_REVISIONS_ON_DATE)
 
-#CREATE VIEW most_recent_revision AS SELECT t1.* FROM revisions t1, (SELECT page_id, MAX(timestamp) timestamp FROM revisions GROUP BY page_id) t2 ON t1.page_id = t2.page_id AND t1.timestamp = t2.timestamp
+    con = sqlite3.connect("lostmediawiki.db")
+    cur = con.cursor()
+
+    SCHEMA = "category  VARCHAR,  \
+              count     INT,      \
+              timestamp DATETIME, \
+              PRIMARY KEY (category, count, timestamp)"
+    create_table_if_empty("status_counts_overtime", SCHEMA, cur)
+
+    earliest_date = datetime(day=10, month=6, year=2014)
+    latest_date = datetime(day=4, month=7, year=2023)
+
+    for timestamp in daterange(earliest_date, latest_date):
+        timestamp = timestamp.strftime("%Y-%d-%m")
+        query = STATUS_COUNTS_ON_DATE % ('"'+str(timestamp)+'"')
+        status_counts = cur.execute(query).fetchall()
+        for status_count in status_counts:
+            cur.execute("INSERT INTO status_counts_overtime (category, count, timestamp) \
+                         VALUES (?, ?, ?)", (status_count[0], status_count[1], timestamp))
+
+    con.commit()
+    con.close()
+
+def status_counts_graph():
+    con = sqlite3.connect("lostmediawiki.db")
+    data = pd.read_sql("SELECT * FROM status_counts_overtime", con, parse_dates=("timestamp"))
+
+    plot = (ggplot(data, aes(x="timestamp", y="count", color="category")) + geom_area()
+                   + scale_x_datetime(date_breaks="1 years", date_labels="%Y"))
+
+    plot.save("aaaaaa.png", dpi=400)
+
+# Before May 2020, lost articles were identified by omission of the other status tags.
+# To track these older revisions, we tag them in categories by extrapolating from
+# when they were refactored in May 2020 to have explicit lost tags.
+
+# TODO: a better way of doing this is to probably look for articles which are in categories (Lost TV, Lost WhATeVr)
+# and also do not have status tags. If precision is an issue then we look at that.
+def extrapolate_older_lost_articles():
+
+    LOST_REFACTORS = "SELECT page_id FROM losted_revisions t1, categories t2 ON t1.rev_id = t2.rev_id WHERE category = 'completely lost media' AND timestamp >= '2019-01-17' AND timestamp <= '2020-05-16' GROUP BY page_id"
+
+    con = sqlite3.connect("lostmediawiki.db")
+    cur = con.cursor()
+    lost_page_ids = cur.execute(LOST_REFACTORS).fetchall()
+
+    for page_id in lost_page_ids:
+        past_revisions = cur.execute("SELECT rev_id FROM losted_revisions WHERE page_id = ? AND timestamp <= '2020-05-16'",
+                                     (page_id[0],)).fetchall()
+        for revision in past_revisions:
+            cur.execute("INSERT OR IGNORE INTO categories (rev_id, category) VALUES (?, ?)",
+                         (revision[0], "completely lost media"))
+
+    con.commit()
+    con.close()
+
 # Any pages with more than 50 revisions? 51st and onward revisions were missed out, you fuck!
 if __name__ == "__main__":
-#    con = sqlite3.connect("lostmediawiki.db")
-#    cur = con.cursor()
-#    status_whitelist(cur)
-#    con.commit()
-#    con.close()
-    parse_categories_for_all_revisions()
+    status_counts_graph()
